@@ -36,6 +36,24 @@ Changes from the previous version (aimed at lifting val_acc):
      which gestures are dragging down val_acc instead of just one
      aggregate number.
 
+Changes in this version (reproducibility / observability, no effect on
+the MP-GRU architecture or inference logic):
+  7. Deterministic random seeding (random / numpy / torch / cuda) so
+     repeated runs with the same args are comparable, with an optional
+     --deterministic-cudnn flag (off by default -- it costs throughput
+     for full determinism, and day-to-day comparisons don't need it).
+  8. File + console logging via the `logging` module -- every epoch's
+     numbers land in a timestamped log file under --log-dir, so a
+     crashed or killed run still leaves a full history.
+  9. tqdm progress bars on both the train and val batch loops, plus an
+     outer epoch progress bar.
+  10. Per-head accuracy logged separately every epoch: proto-only,
+      aux-only, and the combined (blended) accuracy already used for
+      early stopping / checkpointing. This directly answers the "is the
+      auxiliary head doing most of the work" question raised for the
+      prototype+auxiliary setup -- log all three and you can see it
+      epoch by epoch instead of only ever seeing the blended number.
+
 NOTE: I don't have access to gesture_dataset.py, mp_gru.py, or the
 actual cached data, so I can't run this and confirm it clears 70%
 myself -- these are the highest-value, well-established changes for
@@ -46,76 +64,85 @@ on what the per-class breakdown shows you.
 
 import argparse
 import json
+import logging
+import os
+import random
 import time
+from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm import tqdm
 
-from mp_gru import MPGRU
+from model import GestureClassifier
 from gesture_dataset import make_dataloaders
 
 
-class GestureClassifier(nn.Module):
-    def __init__(self,
-                 num_classes: int,
-                 input_size: int = 126,
-                 hidden_size: int = 64,
-                 embedding_size: int = 32,
-                 dropout: float = 0.3,
-                 **mpgru_kwargs):
-        super().__init__()
+# ==========================================================
+# Reproducibility
+# ==========================================================
 
-        self.mpgru = MPGRU(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            **mpgru_kwargs
-        )
+def set_seed(seed: int, deterministic_cudnn: bool = False):
+    """
+    Seed random / numpy / torch (+ CUDA) so repeated runs with the same
+    args are comparable. deterministic_cudnn is off by default: it makes
+    cudnn pick only deterministic kernels, which can meaningfully slow
+    down training (sometimes 10-20%) for a level of determinism that
+    isn't usually needed for day-to-day hyperparameter comparisons on a
+    dataset this small. Turn it on only if you need bit-for-bit repeat
+    runs (e.g. debugging a suspected non-determinism bug).
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
-        self.fc1 = nn.Linear(hidden_size, hidden_size)
-        self.dropout = nn.Dropout(dropout)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
 
-        self.embedding = nn.Linear(hidden_size, embedding_size)
+    if deterministic_cudnn:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    else:
+        torch.backends.cudnn.benchmark = True
 
-        # Auxiliary standard classifier head, trained alongside the
-        # prototype/cosine loss. Reads from `embedding` (not `z`) so both
-        # heads optimize the same feature space instead of two slightly
-        # different ones -- the previous version had the prototype loss
-        # shaping `embedding` while this head shaped `z`, which is an
-        # unnecessary source of inconsistency between the two objectives.
-        self.classifier = nn.Linear(embedding_size, num_classes)
 
-    def forward(self, x, c, lengths):
-        """
-        Returns
-        -------
-        h_final : (B, hidden_size)
-        embedding : (B, embedding_size)  -- L2 normalized
-        class_logits : (B, num_classes)  -- auxiliary head, raw logits
-        """
-        outputs, _, _ = self.mpgru(x, c)
+# ==========================================================
+# Logging
+# ==========================================================
 
-        idx = (lengths - 1).clamp(min=0)
-        idx = idx.view(-1, 1, 1).expand(-1, 1, outputs.size(-1))
-        h_final = outputs.gather(1, idx).squeeze(1)
+def setup_logging(log_dir: str, run_name: str = None):
+    """
+    Configure logging to write to both console and a timestamped file
+    under log_dir. Returns the log file path so it can be printed /
+    referenced later (e.g. attached to a run's saved checkpoint).
+    """
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
 
-        z = F.relu(self.fc1(h_final))
-        z = self.dropout(z)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = run_name or "train"
+    log_path = Path(log_dir) / f"{name}_{timestamp}.log"
 
-        embedding_raw = self.embedding(z)
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    # Clear any handlers from a previous call in the same process
+    # (e.g. if main() is invoked more than once, as in a notebook).
+    root_logger.handlers.clear()
 
-        # Auxiliary classifier sees the raw (unnormalized) embedding --
-        # forcing it through the same L2-normalized unit vector the
-        # prototype loss uses throws away magnitude information a plain
-        # softmax classifier can otherwise use. Both heads still shape
-        # the same underlying linear layer, just observed before vs.
-        # after normalization.
-        class_logits = self.classifier(embedding_raw)
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
 
-        embedding = F.normalize(embedding_raw, p=2, dim=1)
+    file_handler = logging.FileHandler(log_path)
+    file_handler.setFormatter(formatter)
+    root_logger.addHandler(file_handler)
 
-        return h_final, embedding, class_logits
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    root_logger.addHandler(stream_handler)
+
+    return str(log_path)
 
 
 def compute_class_weights(loader, num_classes, device):
@@ -443,7 +470,8 @@ def run_epoch(
         augment=False,
         temporal_warp_aug=False,
         occlusion_prob=0.15,
-        grad_clip=1.0):
+        grad_clip=1.0,
+        progress_desc=None):
     """
     prototypes/counts are FROZEN, computed once per epoch from train_loader
     only (see compute_frozen_prototypes) -- this function never builds its
@@ -462,11 +490,22 @@ def run_epoch(
     assumes both heads are equally reliable, which usually isn't true --
     one typically ends up noticeably stronger than the other, so this is
     exposed as a tunable rather than hardcoded equal weighting.
+
+    Returns a dict with loss and three separate accuracy numbers, so the
+    combined (blended) accuracy can be attributed back to its two heads
+    instead of only ever being reported as one aggregate figure:
+      - "acc"       : accuracy of the blended prediction (what's used
+                      for checkpointing / early stopping)
+      - "proto_acc" : accuracy using ONLY the prototype head's argmax
+      - "aux_acc"   : accuracy using ONLY the auxiliary head's argmax
+      - "per_class_acc" : per-class accuracy of the blended prediction
     """
     model.train() if train else model.eval()
 
     total_loss = 0.0
     total_correct = 0
+    total_proto_correct = 0
+    total_aux_correct = 0
     total_count = 0
 
     num_classes_seen_correct = torch.zeros(num_classes)
@@ -474,8 +513,10 @@ def run_epoch(
 
     context = torch.enable_grad() if train else torch.no_grad()
 
+    iterable = tqdm(loader, desc=progress_desc, leave=False, unit="batch")
+
     with context:
-        for x, c, labels, lengths in loader:
+        for x, c, labels, lengths in iterable:
             x = x.to(device)
             c = c.to(device)
             labels = labels.to(device)
@@ -514,13 +555,18 @@ def run_epoch(
 
             total_loss += loss.item() * x.size(0)
 
-            combined = (
-                eval_proto_weight * F.softmax(proto_logits, dim=1)
-                + (1 - eval_proto_weight) * F.softmax(class_logits, dim=1)
-            )
-            prediction = combined.argmax(dim=1)
+            proto_probs = F.softmax(proto_logits, dim=1)
+            aux_probs = F.softmax(class_logits, dim=1)
+            combined = eval_proto_weight * proto_probs + (1 - eval_proto_weight) * aux_probs
 
-            total_correct += (prediction == labels).sum().item()
+            prediction = combined.argmax(dim=1)
+            proto_prediction = proto_probs.argmax(dim=1)
+            aux_prediction = aux_probs.argmax(dim=1)
+
+            batch_correct = (prediction == labels).sum().item()
+            total_correct += batch_correct
+            total_proto_correct += (proto_prediction == labels).sum().item()
+            total_aux_correct += (aux_prediction == labels).sum().item()
             total_count += x.size(0)
 
             for cls in range(num_classes):
@@ -529,13 +575,20 @@ def run_epoch(
                     num_classes_seen_total[cls] += mask.sum().item()
                     num_classes_seen_correct[cls] += (prediction[mask] == cls).sum().item()
 
+            iterable.set_postfix(
+                loss=f"{loss.item():.3f}",
+                acc=f"{batch_correct / x.size(0):.2f}"
+            )
+
     per_class_acc = (num_classes_seen_correct / num_classes_seen_total.clamp(min=1)).tolist()
 
-    return (
-        total_loss / total_count,
-        total_correct / total_count,
-        per_class_acc
-    )
+    return {
+        "loss": total_loss / total_count,
+        "acc": total_correct / total_count,
+        "proto_acc": total_proto_correct / total_count,
+        "aux_acc": total_aux_correct / total_count,
+        "per_class_acc": per_class_acc,
+    }
 
 
 def main():
@@ -582,33 +635,49 @@ def main():
                          help="Early-stopping patience, in epochs without val_acc improvement. "
                               "Kept comfortably above --scheduler-patience so the LR gets a "
                               "chance to actually help before training gives up.")
+    parser.add_argument("--seed", type=int, default=42,
+                         help="Random seed for random/numpy/torch/cuda")
+    parser.add_argument("--deterministic-cudnn", action="store_true",
+                         help="Force fully deterministic cudnn kernels (slower). Off by "
+                              "default -- seeding alone is enough for day-to-day comparisons.")
+    parser.add_argument("--log-dir", default="logs",
+                         help="Directory to write the timestamped training log file to")
+    parser.add_argument("--run-name", default=None,
+                         help="Optional label used in the log filename, e.g. 'proto_only'")
     args = parser.parse_args()
 
+    log_path = setup_logging(args.log_dir, args.run_name)
+    logging.info(f"Logging to {log_path}")
+    logging.info(f"Args: {vars(args)}")
+
+    set_seed(args.seed, deterministic_cudnn=args.deterministic_cudnn)
+    logging.info(f"Seed set to {args.seed} (deterministic_cudnn={args.deterministic_cudnn})")
+
     if args.balanced_sampler and not args.no_class_weights:
-        print("Note: --balanced-sampler already corrects for class imbalance at the "
-              "sampling level, so loss-level class weights are being disabled to avoid "
-              "stacking both corrections. Pass --no-class-weights explicitly to silence "
-              "this note.")
+        logging.info("Note: --balanced-sampler already corrects for class imbalance at the "
+                      "sampling level, so loss-level class weights are being disabled to avoid "
+                      "stacking both corrections. Pass --no-class-weights explicitly to silence "
+                      "this note.")
         args.no_class_weights = True
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    logging.info(f"Using device: {device}")
 
     train_loader, val_loader, dataset = make_dataloaders(
         args.cache, batch_size=args.batch_size, val_split=args.val_split)
     num_classes = len(dataset.label_to_idx)
     idx_to_label = {v: k for k, v in dataset.label_to_idx.items()}
-    print(f"Classes ({num_classes}): {dataset.label_to_idx}")
-    print(f"Train samples: {len(train_loader.dataset)}, Val samples: {len(val_loader.dataset)}")
+    logging.info(f"Classes ({num_classes}): {dataset.label_to_idx}")
+    logging.info(f"Train samples: {len(train_loader.dataset)}, Val samples: {len(val_loader.dataset)}")
 
     if args.balanced_sampler:
         train_loader = make_balanced_sampler(train_loader)
-        print("Using WeightedRandomSampler for train batches.")
+        logging.info("Using WeightedRandomSampler for train batches.")
 
     class_weights = None
     if not args.no_class_weights:
         class_weights = compute_class_weights(train_loader, num_classes, device)
-        print(f"Class weights (inverse frequency): {class_weights.cpu().tolist()}")
+        logging.info(f"Class weights (inverse frequency): {class_weights.cpu().tolist()}")
 
     model = GestureClassifier(
         num_classes=num_classes,
@@ -627,7 +696,9 @@ def main():
     # Start timer
     start_time = time.time()
 
-    for epoch in range(1, args.epochs + 1):
+    epoch_bar = tqdm(range(1, args.epochs + 1), desc="Epochs", unit="epoch")
+
+    for epoch in epoch_bar:
         epoch_start = time.time()
 
         fresh_prototypes, counts = compute_frozen_prototypes(
@@ -637,7 +708,7 @@ def main():
             ema_prototypes, fresh_prototypes, counts, momentum=args.proto_momentum
         )
 
-        train_loss, train_acc, _ = run_epoch(
+        train_metrics = run_epoch(
             model, train_loader, optimizer, device, train=True,
             num_classes=num_classes, prototypes=ema_prototypes, counts=counts,
             class_weights=class_weights, temperature=args.temperature,
@@ -645,7 +716,8 @@ def main():
             aux_loss_weight=args.aux_loss_weight,
             eval_proto_weight=args.eval_proto_weight,
             augment=args.augment, temporal_warp_aug=args.temporal_warp,
-            occlusion_prob=args.occlusion_prob, grad_clip=args.grad_clip
+            occlusion_prob=args.occlusion_prob, grad_clip=args.grad_clip,
+            progress_desc=f"Epoch {epoch} [train]"
         )
 
         # Re-freeze (and re-blend into the EMA) after the train step's
@@ -659,24 +731,42 @@ def main():
             ema_prototypes, fresh_prototypes, counts, momentum=args.proto_momentum
         )
 
-        val_loss, val_acc, per_class_acc = run_epoch(
+        val_metrics = run_epoch(
             model, val_loader, optimizer, device, train=False,
             num_classes=num_classes, prototypes=ema_prototypes, counts=counts,
             class_weights=class_weights, temperature=args.temperature,
             label_smoothing=args.label_smoothing,
             aux_loss_weight=args.aux_loss_weight,
             eval_proto_weight=args.eval_proto_weight,
-            augment=False, temporal_warp_aug=False, grad_clip=None
+            augment=False, temporal_warp_aug=False, grad_clip=None,
+            progress_desc=f"Epoch {epoch} [val]"
         )
+
+        train_loss, train_acc = train_metrics["loss"], train_metrics["acc"]
+        val_loss, val_acc = val_metrics["loss"], val_metrics["acc"]
+        per_class_acc = val_metrics["per_class_acc"]
 
         scheduler.step(val_loss)
         current_lr = optimizer.param_groups[0]["lr"]
 
         epoch_time = time.time() - epoch_start
 
-        print(f"Epoch {epoch:3d} | train_loss={train_loss:.4f} train_acc={train_acc:.3f} "
-              f"| val_loss={val_loss:.4f} val_acc={val_acc:.3f} "
-              f"| lr={current_lr:.2e} | time={epoch_time:.2f}s")
+        epoch_bar.set_postfix(
+            train_acc=f"{train_acc:.3f}",
+            val_acc=f"{val_acc:.3f}",
+            lr=f"{current_lr:.1e}"
+        )
+
+        # Per-head accuracy, logged separately every epoch -- this is
+        # the data needed to tell whether the auxiliary head or the
+        # prototype head is actually driving the combined accuracy.
+        logging.info(
+            f"Epoch {epoch:3d} | train_loss={train_loss:.4f} train_acc={train_acc:.3f} "
+            f"(proto={train_metrics['proto_acc']:.3f} aux={train_metrics['aux_acc']:.3f}) "
+            f"| val_loss={val_loss:.4f} val_acc={val_acc:.3f} "
+            f"(proto={val_metrics['proto_acc']:.3f} aux={val_metrics['aux_acc']:.3f}) "
+            f"| lr={current_lr:.2e} | time={epoch_time:.2f}s"
+        )
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
@@ -687,17 +777,17 @@ def main():
                 "hidden_size": args.hidden_size,
                 "embedding_size": args.embedding_size,
             }, args.out)
-            print(f"  -> saved new best model (val_acc={val_acc:.3f}) to {args.out}")
-            print("  per-class val acc: " + ", ".join(
+            logging.info(f"  -> saved new best model (val_acc={val_acc:.3f}) to {args.out}")
+            logging.info("  per-class val acc: " + ", ".join(
                 f"{idx_to_label[i]}={a:.2f}" for i, a in enumerate(per_class_acc)
             ))
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= args.patience:
-                print(f"\nNo val_acc improvement for {args.patience} epochs, stopping early.")
+                logging.info(f"No val_acc improvement for {args.patience} epochs, stopping early.")
                 break
 
-    print(f"\nBest val_acc: {best_val_acc:.3f}")
+    logging.info(f"Best val_acc: {best_val_acc:.3f}")
 
     total_time = time.time() - start_time
 
@@ -705,12 +795,9 @@ def main():
     minutes = int((total_time % 3600) // 60)
     seconds = total_time % 60
 
-    print(f"Total training time: {hours}h {minutes}m {seconds:.2f}s")
+    logging.info(f"Total training time: {hours}h {minutes}m {seconds:.2f}s")
+    logging.info(f"Full log saved to {log_path}")
 
 
 if __name__ == "__main__":
     main()
-    
-    
-    
-    
